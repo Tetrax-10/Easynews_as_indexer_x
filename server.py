@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote
 
+import requests
 from flask import Flask, Response, request
 import json
 
@@ -973,11 +974,16 @@ def api():
             )
             return resp
         si = to_search_item(d)
-        c = client()
-        payload = c.build_nzb_payload([si], name=d.get("title"))
-        # fetch content
-        url = "https://members.easynews.com/2.0/api/dl-nzb"
-        r = c.s.post(url, data=payload)
+        try:
+            c = client()
+            payload = c.build_nzb_payload([si], name=d.get("title"))
+            # fetch content
+            url = "https://members.easynews.com/2.0/api/dl-nzb"
+            r = c.s.post(url, data=payload, timeout=60)
+        except EasynewsError as e:
+            return Response(f"Upstream error: {e}", status=502)
+        except requests.exceptions.RequestException as e:
+            return Response(f"Upstream network error: {e}", status=502)
         if r.status_code != 200:
             return Response(f"Upstream error {r.status_code}", status=502)
         # Name file as title.nzb

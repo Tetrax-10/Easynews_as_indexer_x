@@ -12,14 +12,22 @@ You'll need a valid Easynews account. Use responsibly and per Easynews TOS.
 from __future__ import annotations
 
 import base64
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import requests
+from requests.exceptions import RequestException
 
 
 EASYNEWS_BASE = "https://members.easynews.com"
+
+_LOGIN_TIMEOUT = 15
+_SEARCH_TIMEOUT = 30
+_DOWNLOAD_TIMEOUT = 60
+
+logger = logging.getLogger(__name__)
 
 
 class EasynewsError(Exception):
@@ -70,11 +78,16 @@ class EasynewsClient:
         Prime session and validate credentials using a quick authenticated call.
         This relies on HTTP Basic Auth configured on the session.
         """
-        self.s.get(f"{EASYNEWS_BASE}/2.0/")
-        check = self.s.get(
-            f"{EASYNEWS_BASE}/2.0/search/solr-search/?fly=2&gps=test&sb=1&pno=1&pby=1&u=1&chxu=1&chxgx=1&st=basic&s1=dtime&s1d=-&sS=3&vv=1&fty%5B%5D=VIDEO",
-            allow_redirects=True,
-        )
+        try:
+            self.s.get(f"{EASYNEWS_BASE}/2.0/", timeout=_LOGIN_TIMEOUT)
+            check = self.s.get(
+                f"{EASYNEWS_BASE}/2.0/search/solr-search/?fly=2&gps=test&sb=1&pno=1&pby=1&u=1&chxu=1&chxgx=1&st=basic&s1=dtime&s1d=-&sS=3&vv=1&fty%5B%5D=VIDEO",
+                allow_redirects=True,
+                timeout=_LOGIN_TIMEOUT,
+            )
+        except RequestException as e:
+            logger.exception("Network error during Easynews login")
+            raise EasynewsError(f"Network error during Easynews login: {e}") from e
         if check.status_code in (401, 403):
             raise EasynewsError("Unauthorized; check username/password")
 
@@ -123,9 +136,13 @@ class EasynewsClient:
         )
         full_url = f"{url}?{query_params}"
 
-        r = self.s.get(full_url)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = self.s.get(full_url, timeout=_SEARCH_TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except RequestException as e:
+            logger.exception("Search request failed for query '%s'", query)
+            raise EasynewsError(f"Search request failed: {e}") from e
 
     @staticmethod
     def _collect_items(json_data: Dict[str, Any]) -> List[SearchItem]:
@@ -196,7 +213,11 @@ class EasynewsClient:
 
     def download_nzb(self, payload: Dict[str, str], out_path: str) -> str:
         url = f"{EASYNEWS_BASE}/2.0/api/dl-nzb"
-        r = self.s.post(url, data=payload, stream=True)
+        try:
+            r = self.s.post(url, data=payload, stream=True, timeout=_DOWNLOAD_TIMEOUT)
+        except RequestException as e:
+            logger.exception("NZB download request failed")
+            raise EasynewsError(f"NZB download request failed: {e}") from e
         if r.status_code != 200:
             raise EasynewsError(f"NZB creation failed: HTTP {r.status_code}")
 
