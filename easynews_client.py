@@ -20,7 +20,9 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 import requests
+import urllib3
 from requests.exceptions import RequestException
+from urllib3.util.retry import Retry
 
 
 EASYNEWS_BASE = "https://members.easynews.com"
