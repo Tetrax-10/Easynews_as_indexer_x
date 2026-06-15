@@ -26,7 +26,63 @@ from requests.exceptions import ConnectionError, ReadTimeout, RequestException
 from urllib3.util.retry import Retry
 
 
-EASYNEWS_BASE = "https://members.easynews.com"
+# Base URL + search endpoint are overridable via .env so you can A/B-test
+# endpoints with no rebuild (just `docker compose ... up -d`):
+#   EASYNEWS_BASE_URL          host (default https://members.easynews.com)
+#   EASYNEWS_SEARCH_API        "2.0" (solr-search, proven/default) | "3.0" (newer JSON api)
+#   EASYNEWS_SEARCH_URL_TEMPLATE  full override; wins over SEARCH_API. Supports
+#                              {base} {query} {page} {per_page} placeholders.
+#   EASYNEWS_RESULTS_KEY       top-level JSON key holding result rows (default "data")
+#   EASYNEWS_LOG_LATENCY       "true" → log endpoint + per-request latency at INFO
+EASYNEWS_BASE = os.environ.get(
+    "EASYNEWS_BASE_URL", "https://members.easynews.com"
+).rstrip("/")
+_SEARCH_API = os.environ.get("EASYNEWS_SEARCH_API", "2.0").strip()
+_SEARCH_URL_TEMPLATE = os.environ.get("EASYNEWS_SEARCH_URL_TEMPLATE", "").strip()
+_RESULTS_KEY = (os.environ.get("EASYNEWS_RESULTS_KEY", "data").strip() or "data")
+_LOG_LATENCY = os.environ.get("EASYNEWS_LOG_LATENCY", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Optional multi-page fetch. OFF by default so the latency budget is untouched.
+#   EASYNEWS_PAGINATE   "true" → also fetch pages 2..N after the first
+#   EASYNEWS_MAX_PAGES  how many pages total (default 1 = first page only)
+_PAGINATE = os.environ.get("EASYNEWS_PAGINATE", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+try:
+    _MAX_PAGES = max(1, int(os.environ.get("EASYNEWS_MAX_PAGES", "1")))
+except ValueError:
+    _MAX_PAGES = 1
+
+
+def paginate_enabled() -> bool:
+    return _PAGINATE and _MAX_PAGES > 1
+
+
+def max_pages() -> int:
+    return _MAX_PAGES
+
+
+def _active_endpoint_label() -> str:
+    if _SEARCH_URL_TEMPLATE:
+        return "custom-template"
+    return f"api {_SEARCH_API}"
+
+
+def _normalize_response(payload: Any) -> Any:
+    """Map a non-default results key onto ``data`` so the rest of the code,
+    which always reads ``payload['data']``, works regardless of endpoint."""
+    if (
+        _RESULTS_KEY != "data"
+        and isinstance(payload, dict)
+        and _RESULTS_KEY in payload
+        and "data" not in payload
+    ):
+        payload = dict(payload)
+        payload["data"] = payload.get(_RESULTS_KEY) or []
+    return payload
+
 
 _LOGIN_TIMEOUT = 15
 _SEARCH_TIMEOUT = 30
@@ -201,6 +257,76 @@ class EasynewsClient:
         safe_off: int = 0,
         nonce: Optional[float] = None,
     ) -> str:
+        """Dispatch to the configured endpoint builder.
+
+        EASYNEWS_SEARCH_URL_TEMPLATE > EASYNEWS_SEARCH_API. Default is the proven
+        2.0 solr-search builder, so behaviour is unchanged unless you opt in.
+        """
+        if _SEARCH_URL_TEMPLATE:
+            return _SEARCH_URL_TEMPLATE.format(
+                base=EASYNEWS_BASE,
+                query=requests.utils.quote(query),
+                page=page,
+                per_page=per_page,
+            )
+        if _SEARCH_API.startswith("3"):
+            return self._build_search_url_v3(
+                query, file_type, page, per_page, sort_field, sort_dir, safe_off, nonce
+            )
+        return self._build_search_url_solr(
+            query, file_type, page, per_page, sort_field, sort_dir, safe_off, nonce
+        )
+
+    def _build_search_url_v3(
+        self,
+        query: str,
+        file_type: str = "VIDEO",
+        page: int = 1,
+        per_page: int = 50,
+        sort_field: Optional[str] = "relevance",
+        sort_dir: str = "-",
+        safe_off: int = 0,
+        nonce: Optional[float] = None,
+    ) -> str:
+        """Builder for the newer /3.0/api/search JSON endpoint.
+
+        NOTE: the 3.0 request params are not officially documented. These mirror
+        the 2.0 solr params (which Easynews endpoints largely share). If 3.0
+        returns nothing, confirm the real params from the 3.0 web UI's DevTools
+        Network tab and adjust here, or set EASYNEWS_SEARCH_URL_TEMPLATE to the
+        exact request.
+        """
+        params = {
+            "gps": query,
+            "pno": str(page),
+            "pby": str(per_page),
+            "fly": "2",
+            "u": "1",
+            "st": "basic",
+            "safeO": str(safe_off),
+            "_nonce": str(nonce if nonce is not None else random.random()),
+        }
+        if sort_field:
+            params["s1"] = sort_field
+            params["s1d"] = sort_dir
+        url = f"{EASYNEWS_BASE}/3.0/api/search/"
+        query_params = (
+            "&".join([f"{k}={requests.utils.quote(v)}" for k, v in params.items()])
+            + f"&fty%5B%5D={requests.utils.quote(file_type)}"
+        )
+        return f"{url}?{query_params}"
+
+    def _build_search_url_solr(
+        self,
+        query: str,
+        file_type: str = "VIDEO",
+        page: int = 1,
+        per_page: int = 50,
+        sort_field: Optional[str] = "dtime",
+        sort_dir: str = "-",
+        safe_off: int = 0,
+        nonce: Optional[float] = None,
+    ) -> str:
         if file_type != "VIDEO":
             file_type = "VIDEO"
         params = {
@@ -243,9 +369,18 @@ class EasynewsClient:
         full_url = self._build_search_url(
             query, file_type, page, per_page, sort_field, sort_dir, safe_off, nonce
         )
+        t0 = time.monotonic()
         r = self.s.get(full_url, timeout=timeout)
         r.raise_for_status()
-        return r.json()
+        payload = r.json()
+        if _LOG_LATENCY:
+            logger.info(
+                "Easynews search via %s: %.2fs (HTTP %s)",
+                _active_endpoint_label(),
+                time.monotonic() - t0,
+                r.status_code,
+            )
+        return _normalize_response(payload)
 
     def search(
         self,
@@ -377,6 +512,52 @@ class EasynewsClient:
         )
         return last_empty if last_empty is not None else {"data": []}
 
+    def fetch_more_pages(
+        self,
+        query: str,
+        file_type: str = "VIDEO",
+        per_page: int = 250,
+        sort_field: Optional[str] = "relevance",
+        sort_dir: str = "-",
+        start_page: int = 2,
+        max_pages: int = _MAX_PAGES,
+        attempt_timeout: float = _SEARCH_ATTEMPT_TIMEOUT,
+    ) -> List[Any]:
+        """Fetch pages ``start_page..max_pages`` concurrently and return their
+        raw result rows (the per-item entries, before mapping/dedup).
+
+        Opt-in via EASYNEWS_PAGINATE; the caller merges + dedups. Each page uses
+        the same short read timeout as a normal attempt, and we join with a small
+        grace period so a slow page can't hang the request indefinitely.
+        """
+        if max_pages < start_page:
+            return []
+        pages = list(range(start_page, max_pages + 1))
+        out: List[Any] = []
+        lock = threading.Lock()
+
+        def _run(p: int) -> None:
+            try:
+                data = self._search_once(
+                    query, file_type, p, per_page, sort_field, sort_dir,
+                    0, timeout=attempt_timeout, nonce=random.random(),
+                )
+                rows = data.get("data") or []
+                with lock:
+                    out.extend(rows)
+            except Exception as exc:  # noqa: BLE001 - best-effort extra pages
+                logger.warning("Pagination page %d failed: %s", p, _plain_error(exc))
+
+        threads = [
+            threading.Thread(target=_run, args=(p,), name=f"ez-page-{p}", daemon=True)
+            for p in pages
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=attempt_timeout + 1.0)
+        return out
+
     @staticmethod
     def _collect_items(json_data: Dict[str, Any]) -> List[SearchItem]:
         items: List[SearchItem] = []
@@ -390,9 +571,9 @@ class EasynewsClient:
 
             if isinstance(it, list):
                 if len(it) >= 12:
-                    hash_id = it[0]
-                    filename_no_ext = it[10]
-                    ext = it[11]
+                    hash_id = it
+                    filename_no_ext = it
+                    ext = it
             elif isinstance(it, dict):
                 if "0" in it:
                     hash_id = it.get("0", "")
