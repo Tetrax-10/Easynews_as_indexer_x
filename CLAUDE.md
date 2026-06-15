@@ -22,6 +22,7 @@ There is no build step beyond the Docker image — the repo *is* the artifact.
 ```
 NZBHydra/Sonarr/Radarr ──GET /api?t=search&q=…&apikey=… ──▶ server.py
         server.py ──▶ EasynewsClient.search_hedged() ──▶ members.easynews.com/2.0/search/solr-search
+                                                          (endpoint configurable: 2.0 | 3.0, see Configuration)
         server.py ◀── filter_and_map() → Newznab RSS
 download: client ──GET /api?t=get&id=… ──▶ decode id ──▶ POST …/2.0/api/dl-nzb ──▶ .nzb
 ```
@@ -62,10 +63,38 @@ See `.env.example` for the full annotated list. Summary:
 | `SEARCH_BUDGET_SECONDS` | `3.3` | Hard cap on total time per search |
 | `SEARCH_HEDGE_AFTER_SECONDS` | `1.2` | Fire a parallel "hedge" request if Easynews is slower than this |
 | `SEARCH_ATTEMPT_TIMEOUT_SECONDS` | `2.5` | Per-request read timeout |
+| `IGNORE_SEASON_PACKS` | `false` | Skip season-only queries (season, no episode) — Easynews rarely has real packs |
+| `EASYNEWS_SEARCH_API` | `2.0` | Search endpoint: `2.0` (`/2.0/search/solr-search/`) or `3.0` (`/3.0/api/search/`) |
+| `EASYNEWS_BASE_URL` | `https://members.easynews.com` | Override the Easynews host |
+| `EASYNEWS_SEARCH_URL_TEMPLATE` | — | Full search-URL override (wins over `SEARCH_API`); placeholders `{base}{query}{page}{per_page}` |
+| `EASYNEWS_RESULTS_KEY` | `data` | Top-level JSON key holding result rows |
+| `EASYNEWS_LOG_LATENCY` | `false` | Log active endpoint + per-request latency at INFO |
+| `EASYNEWS_DISABLE_FILTERS` | `false` | Skip title-matching filters (validity/size/virus/duration still apply) |
+| `EASYNEWS_META_SUBS` | `true` | Emit subtitle langs as `newznab:attr name="subs"` |
+| `EASYNEWS_META_AUDIO` | `true` | Emit audio langs as `newznab:attr name="language"` |
+| `EASYNEWS_META_CODECS` | `true` | Emit video/audio codecs as `newznab:attr name="video"`/`"audio"` |
+| `EASYNEWS_PAGINATE` | `false` | Fetch extra search pages (concurrent, hash-deduped) — adds latency |
+| `EASYNEWS_MAX_PAGES` | `1` | Pages to fetch when `EASYNEWS_PAGINATE` is on |
 
-The `SEARCH_*` knobs are read at **container start** (change `.env` → `up -d`, no
+All of the above are read at **container start** (change `.env` → `up -d`, no
 rebuild). Keep this invariant true:
 `HEDGE_AFTER < ATTEMPT_TIMEOUT ≤ BUDGET < client's indexer timeout`.
+
+**Search endpoint (2.0 vs 3.0).** `EASYNEWS_SEARCH_API` switches between the proven
+`/2.0/search/solr-search/` and the newer JSON `/3.0/api/search/`. Default is `2.0`,
+so behaviour is unchanged unless you opt in. The 3.0 request params aren't
+officially documented — if it returns nothing, grab the real request from the 3.0
+web UI's DevTools and set `EASYNEWS_SEARCH_URL_TEMPLATE` (no code change). The NZB
+**download** path stays on `/2.0/api/dl-nzb` regardless. `EASYNEWS_LOG_LATENCY` and
+the per-search log line (`Search 'x' [api 3.0] → …`) are there to compare speed;
+`easynews_endpoint_benchmark.sh` does an A/B curl test.
+
+**Language/codec metadata.** `subs`/`language`/`video`/`audio` attrs are populated
+from Easynews's named JSON fields (`subtitle_tracks`/`slangs`, `audio_tracks`/`alangs`,
+`vcodec`, `acodec`), which only exist on the 3.0 api and the 2.0 *dict* response form
+(not the positional array form). AIOStreams reads `subs` (subtitles) and `language`
+(audio). **Caveat:** if results flow through NZBHydra2, it must be configured to pass
+these attrs through to the downstream client.
 
 Still hardcoded (change in code if needed): `_CLIENT_LOGIN_TTL=1800` (server.py),
 min file size `100` MB (also per-request via `&minsize=`), `_MIN_DURATION_SECONDS=60`,
