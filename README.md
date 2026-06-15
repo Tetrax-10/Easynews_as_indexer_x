@@ -95,7 +95,7 @@ All optional and read at startup — set them in `.env` (or `-e` flags) and rest
 
 **Search endpoint (A/B testing speed).** Switch which Easynews endpoint is used:
 
-- `EASYNEWS_SEARCH_API` — `2.0` (default, `/2.0/search/solr-search/`) or `3.0` (`/3.0/api/search/`, newer JSON API)
+- `EASYNEWS_SEARCH_API` — `2.0` (default, `/2.0/search/solr-search/`) or `3.0` (`/3.0/api/search`, newer JSON API — leaner payload, ~3x smaller)
 - `EASYNEWS_SEARCH_URL_TEMPLATE` — full URL override if the 3.0 params differ (placeholders `{base}` `{query}` `{page}` `{per_page}`); wins over `EASYNEWS_SEARCH_API`
 - `EASYNEWS_BASE_URL`, `EASYNEWS_RESULTS_KEY`, `EASYNEWS_LOG_LATENCY` — host override, alternate JSON results key, and per-request latency logging
 
