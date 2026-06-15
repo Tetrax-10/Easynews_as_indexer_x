@@ -99,6 +99,14 @@ _SEARCH_BUDGET = float(os.environ.get("SEARCH_BUDGET_SECONDS", "3.3"))
 _SEARCH_HEDGE_AFTER = float(os.environ.get("SEARCH_HEDGE_AFTER_SECONDS", "1.2"))
 _SEARCH_ATTEMPT_TIMEOUT = float(os.environ.get("SEARCH_ATTEMPT_TIMEOUT_SECONDS", "2.5"))
 
+# Trust a successful HTTP-200-with-no-data as a genuine "0 results" and return
+# immediately, instead of retrying up to max_attempts and idling out the budget.
+# A real hang/timeout surfaces as an *error* (which still retries + hedges), so
+# an "ok" empty really is empty. Set false for the old 3-try-on-empty behaviour.
+_TRUST_EMPTY = os.environ.get("SEARCH_TRUST_EMPTY", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -485,6 +493,7 @@ class EasynewsClient:
             threading.Thread(target=_run, name=f"ez-search-{idx}", daemon=True).start()
 
         start = time.monotonic()
+        received = 0
         _launch()
         while True:
             remaining = deadline - time.monotonic()
@@ -501,6 +510,7 @@ class EasynewsClient:
                     _launch()  # in-flight attempt is dragging → hedge
                 continue
 
+            received += 1
             if kind == "ok" and payload.get("data"):
                 if started > 1:
                     logger.info(
@@ -509,14 +519,26 @@ class EasynewsClient:
                     )
                 return payload
             if kind == "ok":
-                last_empty = payload  # spurious empty — remember, but keep trying
+                # A successful HTTP 200 with no rows. A hang/timeout would arrive
+                # as an error, not here, so this is a genuine "0 results".
+                if _TRUST_EMPTY:
+                    return payload
+                last_empty = payload  # keep the old 3-try-on-empty behaviour
             if started < max_attempts:
                 _launch()  # error or empty → try a fresh request within budget
+            elif received >= started:
+                break  # every attempt has reported back — nothing left to wait for
 
-        logger.warning(
-            "Search %r hit the %.1fs budget after %d attempt(s); returning best effort.",
-            query, budget, started,
-        )
+        if started > 0 and received >= started:
+            logger.info(
+                "Search %r: %d attempt(s) returned no data in %.1fs.",
+                query, started, time.monotonic() - start,
+            )
+        else:
+            logger.warning(
+                "Search %r hit the %.1fs budget after %d attempt(s); returning best effort.",
+                query, budget, started,
+            )
         return last_empty if last_empty is not None else {"data": []}
 
     def fetch_more_pages(
