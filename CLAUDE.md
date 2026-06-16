@@ -73,6 +73,7 @@ See `.env.example` for the full annotated list. Summary:
 | `EASYNEWS_DISABLE_FILTERS` | `false` | Skip title-matching filters (validity/size/virus/duration still apply) |
 | `EASYNEWS_DEDUP_KEEP_NEWEST` | `false` | On identical-hash duplicates, keep the newest post instead of the first (re-packed re-uploads differ in hash, so aren't merged anyway) |
 | `EASYNEWS_ALLOW_PASSWORD` | `false` | Keep results Easynews flags password-protected (often a false positive; stremthru/AIOStreams keep them). Virus-flagged always dropped |
+| `EASYNEWS_STRIP_STOPWORDS` | `true` | Drop connector words (and/of/the/…) from the query sent to Easynews — it AND-matches every word, so an expanded title ("Escha and Logy") otherwise zeroes out against releases named "Escha..Logy" |
 | `EASYNEWS_META_SUBS` | `true` | Emit subtitle langs as `newznab:attr name="subs"` |
 | `EASYNEWS_META_AUDIO` | `true` | Emit audio langs as `newznab:attr name="language"` |
 | `EASYNEWS_META_CODECS` | `true` | Emit video/audio codecs as `newznab:attr name="video"`/`"audio"` |
