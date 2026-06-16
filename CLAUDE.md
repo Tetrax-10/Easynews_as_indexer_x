@@ -72,6 +72,7 @@ See `.env.example` for the full annotated list. Summary:
 | `EASYNEWS_LOG_LATENCY` | `false` | Log active endpoint + per-request latency at INFO |
 | `EASYNEWS_DISABLE_FILTERS` | `false` | Skip title-matching filters (validity/size/virus/duration still apply) |
 | `EASYNEWS_DEDUP_KEEP_NEWEST` | `false` | On identical-hash duplicates, keep the newest post instead of the first (re-packed re-uploads differ in hash, so aren't merged anyway) |
+| `EASYNEWS_ALLOW_PASSWORD` | `false` | Keep results Easynews flags password-protected (often a false positive; stremthru/AIOStreams keep them). Virus-flagged always dropped |
 | `EASYNEWS_META_SUBS` | `true` | Emit subtitle langs as `newznab:attr name="subs"` |
 | `EASYNEWS_META_AUDIO` | `true` | Emit audio langs as `newznab:attr name="language"` |
 | `EASYNEWS_META_CODECS` | `true` | Emit video/audio codecs as `newznab:attr name="video"`/`"audio"` |
