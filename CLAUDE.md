@@ -74,6 +74,8 @@ See `.env.example` for the full annotated list. Summary:
 | `EASYNEWS_META_SUBS` | `true` | Emit subtitle langs as `newznab:attr name="subs"` |
 | `EASYNEWS_META_AUDIO` | `true` | Emit audio langs as `newznab:attr name="language"` |
 | `EASYNEWS_META_CODECS` | `true` | Emit video/audio codecs as `newznab:attr name="video"`/`"audio"` |
+| `EASYNEWS_EXTRA_TERMS` | — | Comma-separated; also runs `<query> <term>` per term and merges (e.g. `nordic, danish` surfaces deep-ranked language-tagged releases on page 1) |
+| `EASYNEWS_REQUIRE_SUBS` | — | Comma-separated lang codes (e.g. `nor`); keep only releases whose subtitle tracks include one. Per-request override: `&subs=nor` on the `/api` URL |
 | `EASYNEWS_PAGINATE` | `false` | Fetch extra search pages (concurrent, hash-deduped) — adds latency |
 | `EASYNEWS_MAX_PAGES` | `1` | Pages to fetch when `EASYNEWS_PAGINATE` is on |
 
