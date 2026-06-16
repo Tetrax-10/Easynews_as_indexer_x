@@ -21,6 +21,7 @@ from easynews_client import (
     _active_endpoint_label,
     paginate_enabled,
     max_pages,
+    _SEARCH_ATTEMPT_TIMEOUT,
 )
 
 
@@ -453,6 +454,23 @@ def _tokenize(text: str) -> List[str]:
         tok for tok in normalized.split() if len(tok) > 1 and tok not in _STOPWORDS
     ]
     return tokens
+
+
+_MULTIDASH_RE = re.compile(r"-{2,}")
+
+
+def _clean_search_query(text: str) -> str:
+    """Neutralise client quirks before sending the query to Easynews: collapse
+    runs of dashes (e.g. "Avengers --1080p" → "Avengers 1080p", which Easynews
+    otherwise treats as a broken exclude and answers slowly/empty) and strip
+    stray leading dashes per token. Internal single dashes (hyphenated titles
+    like "Spider-Man") are preserved. Downstream filtering still uses the raw
+    query, so this only changes what we ask Easynews."""
+    if not text:
+        return text
+    cleaned = _MULTIDASH_RE.sub(" ", text)
+    cleaned = " ".join(tok.lstrip("-") for tok in cleaned.split())
+    return cleaned.strip()
 
 
 def _sanitize_phrase(text: str) -> str:
@@ -1000,11 +1018,35 @@ def api():
         else:
             c = client()
             search_start = time.time()
+            # Sanitise the outbound query so a client quirk like "Avengers
+            # --1080p" doesn't become a broken/slow Easynews query. Filtering
+            # still uses the raw query (query_tokens/strict_phrase).
+            search_q = _clean_search_query(q)
+
+            # Kick off the extra-term searches (EASYNEWS_EXTRA_TERMS) CONCURRENTLY
+            # with the bare search, so a slow query doesn't pay for them serially
+            # (was bare-budget + term-timeouts ≈ 6s; now ≈ max of the two).
+            aug_holder: Dict[str, List[Any]] = {"rows": []}
+            aug_thread: Optional[threading.Thread] = None
+            if EXTRA_TERMS and search_q:
+                aug_queries = [f"{search_q} {term}".strip() for term in EXTRA_TERMS]
+
+                def _run_aug() -> None:
+                    aug_holder["rows"] = c.search_queries(
+                        aug_queries, file_type="VIDEO", per_page=250,
+                        sort_field="relevance", sort_dir="-",
+                    )
+
+                aug_thread = threading.Thread(
+                    target=_run_aug, name="ez-extra-terms", daemon=True
+                )
+                aug_thread.start()
+
             # Latency-bounded, hedged search: returns the first real results and
             # is hard-capped well under NZBHydra's 4s timeout, so a slow/hung
             # Easynews response no longer surfaces as "0 results".
             data = c.search_hedged(
-                query=q,
+                query=search_q,
                 file_type="VIDEO",
                 per_page=250,
                 sort_field="relevance",
@@ -1023,22 +1065,18 @@ def api():
                 pages_wanted = min(max_pages(), max(total_pages, 1))
                 if pages_wanted > 1:
                     extra_rows = c.fetch_more_pages(
-                        q, file_type="VIDEO", per_page=250,
+                        search_q, file_type="VIDEO", per_page=250,
                         sort_field="relevance", sort_dir="-",
                         start_page=2, max_pages=pages_wanted,
                     )
                     if extra_rows:
                         data = {**data, "data": list(data.get("data") or []) + extra_rows}
-            # Extra-term searches (EASYNEWS_EXTRA_TERMS): run "<query> <term>"
-            # for each term and prepend the rows, so language-tagged releases the
-            # bare ranking buries deep land within the client's limit. Same
-            # downstream filtering applies, so off-target shows are still dropped.
-            if EXTRA_TERMS and q:
-                aug_rows = c.search_queries(
-                    [f"{q} {term}".strip() for term in EXTRA_TERMS],
-                    file_type="VIDEO", per_page=250,
-                    sort_field="relevance", sort_dir="-",
-                )
+            # Merge the concurrently-fetched extra-term rows. Prepended so the
+            # targeted matches survive the client's limit cut; same downstream
+            # filtering applies, so off-target shows are still dropped.
+            if aug_thread is not None:
+                aug_thread.join(timeout=_SEARCH_ATTEMPT_TIMEOUT + 1.0)
+                aug_rows = aug_holder.get("rows") or []
                 if aug_rows:
                     data = {**data, "data": list(aug_rows) + list(data.get("data") or [])}
                     logger.info(
