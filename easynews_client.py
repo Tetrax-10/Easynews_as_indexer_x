@@ -587,6 +587,47 @@ class EasynewsClient:
             t.join(timeout=attempt_timeout + 1.0)
         return out
 
+    def search_queries(
+        self,
+        queries: List[str],
+        file_type: str = "VIDEO",
+        per_page: int = 250,
+        sort_field: Optional[str] = "relevance",
+        sort_dir: str = "-",
+        attempt_timeout: float = _SEARCH_ATTEMPT_TIMEOUT,
+    ) -> List[Any]:
+        """Run several queries concurrently (one shot each) and return their
+        merged raw rows. Used for EASYNEWS_EXTRA_TERMS — e.g. firing the bare
+        query plus "<query> nordic"/"<query> danish" so language-tagged releases
+        that the bare relevance ranking buries deep show up on page 1. The caller
+        merges + dedups (filter_and_map dedups by hash)."""
+        out: List[Any] = []
+        if not queries:
+            return out
+        lock = threading.Lock()
+
+        def _run(query: str) -> None:
+            try:
+                data = self._search_once(
+                    query, file_type, 1, per_page, sort_field, sort_dir,
+                    0, timeout=attempt_timeout, nonce=random.random(),
+                )
+                rows = data.get("data") or []
+                with lock:
+                    out.extend(rows)
+            except Exception as exc:  # noqa: BLE001 - best-effort supplementary search
+                logger.warning("Extra-term search %r failed: %s", query, _plain_error(exc))
+
+        threads = [
+            threading.Thread(target=_run, args=(qq,), name=f"ez-term-{i}", daemon=True)
+            for i, qq in enumerate(queries)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=attempt_timeout + 1.0)
+        return out
+
     @staticmethod
     def _collect_items(json_data: Dict[str, Any]) -> List[SearchItem]:
         items: List[SearchItem] = []
