@@ -116,6 +116,13 @@ IGNORE_SEASON_PACKS = _env_bool("IGNORE_SEASON_PACKS", False)
 # returns. Default off → behaviour unchanged.
 DISABLE_RESULT_FILTERS = _env_bool("EASYNEWS_DISABLE_FILTERS", False)
 
+# When de-duplicating identical-hash entries, keep the one with the newest post
+# date instead of the first (which is by relevance). Helps when an old post has
+# gone dead and the exact same file was re-posted later. Note: re-packed/re-
+# encoded re-uploads have a *different* hash and are never deduped anyway.
+# Default off = keep first (unchanged behaviour).
+DEDUP_KEEP_NEWEST = _env_bool("EASYNEWS_DEDUP_KEEP_NEWEST", False)
+
 # Extra metadata emitted as newznab:attr so downstream tools can use it. The
 # audio/subtitle language codes come from Easynews's named JSON fields
 # (subtitle_tracks/slangs, audio_tracks/alangs) and only exist when the endpoint
@@ -659,6 +666,17 @@ def _matches_strict(title: str, strict_phrase: Optional[str]) -> bool:
     return False
 
 
+def _posted_epoch(value: Any) -> float:
+    """Best-effort sortable epoch for a result's post date, for the dedup
+    tie-break. Handles unix timestamps directly and parses date strings."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    dt = _coerce_datetime(value)
+    return dt.timestamp() if dt else 0.0
+
+
 def filter_and_map(
     json_data: dict,
     min_bytes: int,
@@ -672,6 +690,7 @@ def filter_and_map(
     thumb_base = json_data.get("thumbURL") or json_data.get("thumbUrl")
     out: List[dict] = []
     seen_hashes: Set[str] = set()
+    seen_index: Dict[str, int] = {}  # hash -> index in out (for keep-newest dedup)
     for it in json_data.get("data", []):
         hash_id: Optional[str] = None
         subject: Optional[str] = None
@@ -732,9 +751,12 @@ def filter_and_map(
         if not hash_id or not ext:
             continue
 
-        if hash_id in seen_hashes:
-            continue
-        seen_hashes.add(hash_id)
+        # Fast path: drop repeat hashes (keep first). When keep-newest is on we
+        # defer the decision to the append site so we can compare post dates.
+        if not DEDUP_KEEP_NEWEST:
+            if hash_id in seen_hashes:
+                continue
+            seen_hashes.add(hash_id)
 
         filename_no_ext = filename_no_ext or ""
         ext = ext or ""
@@ -815,29 +837,38 @@ def filter_and_map(
         thumbnail_url = _build_thumbnail_url(thumb_base, hash_id, filename_no_ext)
         year = title_meta.get("year")
 
-        out.append(
-            {
-                "hash": hash_id,
-                "filename": filename_no_ext,
-                "ext": ext,
-                "sig": sig,
-                "size": size,
-                "title": title,
-                "poster": poster,
-                "posted": posted_raw,
-                "duration": duration_seconds,
-                "duration_hms": duration_formatted,
-                "quality": quality,
-                "thumbnail": thumbnail_url,
-                "year": year,
-                "season": title_meta.get("season"),
-                "episode": title_meta.get("episode"),
-                "subs": _join_langs(sub_langs),
-                "audio_langs": _join_langs(audio_langs),
-                "vcodec": (str(vcodec).strip() or None) if vcodec else None,
-                "acodec": (str(acodec).strip() or None) if acodec else None,
-            }
-        )
+        item = {
+            "hash": hash_id,
+            "filename": filename_no_ext,
+            "ext": ext,
+            "sig": sig,
+            "size": size,
+            "title": title,
+            "poster": poster,
+            "posted": posted_raw,
+            "duration": duration_seconds,
+            "duration_hms": duration_formatted,
+            "quality": quality,
+            "thumbnail": thumbnail_url,
+            "year": year,
+            "season": title_meta.get("season"),
+            "episode": title_meta.get("episode"),
+            "subs": _join_langs(sub_langs),
+            "audio_langs": _join_langs(audio_langs),
+            "vcodec": (str(vcodec).strip() or None) if vcodec else None,
+            "acodec": (str(acodec).strip() or None) if acodec else None,
+        }
+
+        if DEDUP_KEEP_NEWEST:
+            prev = seen_index.get(hash_id)
+            if prev is not None:
+                # Same file seen already — keep whichever was posted more recently.
+                if _posted_epoch(posted_raw) > _posted_epoch(out[prev].get("posted")):
+                    out[prev] = item
+                continue
+            seen_index[hash_id] = len(out)
+
+        out.append(item)
     return out
 
 
