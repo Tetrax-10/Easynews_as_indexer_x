@@ -127,6 +127,33 @@ META_SUBS = _env_bool("EASYNEWS_META_SUBS", True)
 META_AUDIO = _env_bool("EASYNEWS_META_AUDIO", True)
 META_CODECS = _env_bool("EASYNEWS_META_CODECS", True)
 
+# Extra search terms (comma-separated). For each one, the bridge also runs
+# "<query> <term>" alongside the bare query and merges the results. Easynews
+# AND-matches the term, so a language tag like "nordic" surfaces releases that
+# the bare relevance ranking buries deep (e.g. "From S01E04 nordic" returns the
+# NORDiC release on page 1). Example: EASYNEWS_EXTRA_TERMS=nordic, danish, norsk
+# Each term adds one (concurrent) request per search. Empty = feature off.
+EXTRA_TERMS = [
+    term.strip()
+    for term in os.environ.get("EASYNEWS_EXTRA_TERMS", "").split(",")
+    if term.strip()
+]
+
+
+def _parse_langs_csv(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [v.strip().lower() for v in value.split(",") if v.strip()]
+
+
+# Restrict results to releases whose subtitle tracks include at least one of
+# these language codes (e.g. "nor" for Norwegian, "nor,swe" for either). Global
+# default; can be overridden per request with &subs= on the /api URL. Empty =
+# no restriction. NOTE: only keeps items where Easynews actually reports a
+# matching subtitle track, so it's strict — releases whose subs Easynews didn't
+# index are dropped. Pairs well with EASYNEWS_EXTRA_TERMS=nordic.
+REQUIRE_SUBS = _parse_langs_csv(os.environ.get("EASYNEWS_REQUIRE_SUBS"))
+
 
 def _join_langs(value: Any) -> Optional[str]:
     """Normalise a language field (list like ['nor','eng'] or a comma string)
@@ -610,6 +637,7 @@ def filter_and_map(
     query_meta: Optional[Dict[str, Optional[Any]]] = None,
     strict_phrase: Optional[str] = None,
     strict_match: bool = False,
+    require_subs: Optional[List[str]] = None,
 ) -> List[dict]:
     token_set: Set[str] = set(query_tokens or [])
     thumb_base = json_data.get("thumbURL") or json_data.get("thumbUrl")
@@ -743,6 +771,15 @@ def filter_and_map(
         if not DISABLE_RESULT_FILTERS and token_set:
             title_tokens = set(_tokenize(title))
             if not title_tokens or not token_set.issubset(title_tokens):
+                continue
+
+        # Subtitle-language requirement (global EASYNEWS_REQUIRE_SUBS or per
+        # request &subs=). Keep only releases whose reported subtitle tracks
+        # include at least one requested language. Not gated by
+        # DISABLE_RESULT_FILTERS — it's an explicit content requirement.
+        if require_subs:
+            item_sub_set = {s for s in (_join_langs(sub_langs) or "").split(",") if s}
+            if not (item_sub_set & set(require_subs)):
                 continue
 
         duration_formatted = _format_duration(duration_seconds)
@@ -891,6 +928,16 @@ def api():
                 min_size_mb = 100
         min_bytes = min_size_mb * 1024 * 1024
 
+        # Per-request subtitle-language requirement (&subs=nor or &subs=nor,swe).
+        # Overrides the global EASYNEWS_REQUIRE_SUBS; &subs= (empty) disables it
+        # for this request.
+        subs_param = request.args.get("subs")
+        if subs_param is None:
+            subs_param = request.args.get("requiresubs")
+        require_subs = (
+            _parse_langs_csv(subs_param) if subs_param is not None else REQUIRE_SUBS
+        )
+
         season_pack_query = (
             query_meta.get("season") is not None
             and query_meta.get("episode") is None
@@ -965,14 +1012,39 @@ def api():
             )
             # Optional extra pages (EASYNEWS_PAGINATE). Off by default; adds
             # latency, so only worth it when you've raised the search budget.
+            # Respect the response's numPages: never fetch pages that don't
+            # exist, so a single-page query costs zero extra calls even with a
+            # high EASYNEWS_MAX_PAGES.
             if paginate_enabled() and data.get("data"):
-                extra_rows = c.fetch_more_pages(
-                    q, file_type="VIDEO", per_page=250,
+                try:
+                    total_pages = int(data.get("numPages") or 1)
+                except (TypeError, ValueError):
+                    total_pages = 1
+                pages_wanted = min(max_pages(), max(total_pages, 1))
+                if pages_wanted > 1:
+                    extra_rows = c.fetch_more_pages(
+                        q, file_type="VIDEO", per_page=250,
+                        sort_field="relevance", sort_dir="-",
+                        start_page=2, max_pages=pages_wanted,
+                    )
+                    if extra_rows:
+                        data = {**data, "data": list(data.get("data") or []) + extra_rows}
+            # Extra-term searches (EASYNEWS_EXTRA_TERMS): run "<query> <term>"
+            # for each term and prepend the rows, so language-tagged releases the
+            # bare ranking buries deep land within the client's limit. Same
+            # downstream filtering applies, so off-target shows are still dropped.
+            if EXTRA_TERMS and q:
+                aug_rows = c.search_queries(
+                    [f"{q} {term}".strip() for term in EXTRA_TERMS],
+                    file_type="VIDEO", per_page=250,
                     sort_field="relevance", sort_dir="-",
-                    start_page=2, max_pages=max_pages(),
                 )
-                if extra_rows:
-                    data = {**data, "data": list(data.get("data") or []) + extra_rows}
+                if aug_rows:
+                    data = {**data, "data": list(aug_rows) + list(data.get("data") or [])}
+                    logger.info(
+                        "Extra-term search added %d row(s) from term(s): %s",
+                        len(aug_rows), ", ".join(EXTRA_TERMS),
+                    )
             elapsed = time.time() - search_start
             raw_count = len(data.get("data", []))
             items = filter_and_map(
@@ -982,10 +1054,12 @@ def api():
                 query_meta=query_meta,
                 strict_phrase=strict_phrase,
                 strict_match=strict_requested,
+                require_subs=require_subs,
             )
+            subs_note = f", subs={'+'.join(require_subs)}" if require_subs else ""
             logger.info(
-                "Search %r [%s] → %d raw results, %d passed filters, in %.1fs",
-                q, _active_endpoint_label(), raw_count, len(items), elapsed,
+                "Search %r [%s%s] → %d raw results, %d passed filters, in %.1fs",
+                q, _active_endpoint_label(), subs_note, raw_count, len(items), elapsed,
             )
 
         items = items[offset : offset + limit]
