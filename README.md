@@ -2,7 +2,12 @@
 
 A Flask server that bridges **Easynews** search to a **Newznab-like API**, so you can add Easynews as a custom indexer in **Prowlarr / NZBHydra2** and pull NZBs from it (and feed it into **AIOStreams**, Stremio, etc.). Video-only, sorted by relevance.
 
-This is a fork of [**Sanket9225/Easynews_as_indexer**](https://github.com/Sanket9225/Easynews_as_indexer). It keeps the same `/api` Newznab surface but is re-tuned for **reliability behind a strict downstream timeout** (NZBHydra2's ~4 s) and for **surfacing language-tagged releases** (Nordic/Norwegian-subbed, anime). All new behaviour is opt-in or matches the original's defaults, so it's a drop-in replacement.
+This is a fork of [**Sanket9225/Easynews_as_indexer**](https://github.com/Sanket9225/Easynews_as_indexer). It keeps the same `/api` Newznab surface but is re-tuned for **reliability behind a strict downstream timeout** (NZBHydra2's ~4 s) and for **surfacing language-tagged releases** (Nordic/Norwegian-subbed in current compose change to what you like. Anime focused search very limited testing done here as i dont watch anime). All new behaviour is opt-in or matches the original's defaults, so it's a drop-in replacement.
+
+Including passworded releases "idea" was taken from munif/stremthru dev's research, read him talking about it in either his discord chat or aiostreams. 
+Utilizing the API 3.0 endpoint was taken from  "nanzepanze" user in munif's discord chat. 
+
+Probably some other things are from either virens aiostream easynews builtin addon code or munif stremthru easynews tag, as I asked claude to review both to look for anything useful. But base code is from sankets easynews-indexer repo. 
 
 ---
 
