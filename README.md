@@ -158,10 +158,10 @@ Credentials are required; everything else is optional and read at startup. Set t
 ## Integration
 
 **Prowlarr / NZBHydra2** — add a Newznab (generic) indexer:
-- URL: `http://<host>:8081` (or the container name on your Docker network, e.g. `http://easynews-indexer:8081`)
+- URL: `http://<host>:8081` (or the container name on your Docker network, e.g. `http://easynews-indexer:8081` or `http://easynews-indexer-anime:8081` etc.. )
 - API Key: the `NEWZNAB_APIKEY` from your `.env`
 
-> If you route through **NZBHydra2**, configure it to pass `newznab:attr` attributes through, or the language/codec metadata won't reach the downstream client. Keep Hydra's own indexer timeout at ~4 s, comfortably above `SEARCH_BUDGET_SECONDS`.
+> If you route through **NZBHydra2**,  Keep Hydra's own indexer timeout at ~4 s, comfortably above `SEARCH_BUDGET_SECONDS`.
 
 **AIOStreams** — reads the `subs` attr as subtitle languages and `language` as audio languages, so the language metadata this fork emits lets you filter (e.g. to Norwegian subs).
 
