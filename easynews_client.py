@@ -218,6 +218,9 @@ class EasynewsClient:
             }
         )
         self.s.auth = (self.username, self.password)
+        # Keepalive bookkeeping (warms the pooled TLS connection during idle gaps).
+        self._last_activity = time.monotonic()
+        self._keepalive_started = False
         # Pool sized for peak burst: gunicorn threads × hedge attempts (4×3=12).
         _adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
         self.s.mount("https://", _adapter)
@@ -257,6 +260,37 @@ class EasynewsClient:
             raise EasynewsError("Unauthorized — check EASYNEWS_USER and EASYNEWS_PASS")
 
         logger.info("Login succeeded.")
+
+    def start_keepalive(self, interval: float = 45.0, idle_after: float = 40.0) -> None:
+        """
+        Hold a warm TLS connection open during idle gaps so the next real search
+        skips the cold handshake. Pings the lightest possible search (one result)
+        via _build_search_url, so it automatically uses whatever EASYNEWS_SEARCH_API
+        is configured. Only fires after ``idle_after`` seconds of no search traffic,
+        so active bursts keep it out of the way. Best-effort and stateless — a
+        failed ping is harmless (the next search re-authenticates regardless).
+        """
+        if self._keepalive_started:
+            return
+        self._keepalive_started = True
+
+        def _run() -> None:
+            while True:
+                time.sleep(interval)
+                if time.monotonic() - self._last_activity < idle_after:
+                    continue  # real traffic is keeping the connection warm
+                try:
+                    url = self._build_search_url(query="test", per_page=1)
+                    self.s.get(url, timeout=10)
+                    self._last_activity = time.monotonic()
+                except Exception as exc:  # noqa: BLE001 — keepalive is best-effort
+                    logger.debug("Keepalive ping failed (harmless): %s", exc)
+
+        threading.Thread(target=_run, name="ez-keepalive", daemon=True).start()
+        logger.info(
+            "Keepalive started (ping every %.0fs when idle > %.0fs).",
+            interval, idle_after,
+        )
 
     def _build_search_url(
         self,
@@ -389,6 +423,7 @@ class EasynewsClient:
             query, file_type, page, per_page, sort_field, sort_dir, safe_off, nonce
         )
         t0 = time.monotonic()
+        self._last_activity = t0
         r = self.s.get(full_url, timeout=timeout)
         r.raise_for_status()
         payload = r.json()
