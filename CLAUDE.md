@@ -64,6 +64,9 @@ See `.env.example` for the full annotated list. Summary:
 | `SEARCH_HEDGE_AFTER_SECONDS` | `1.2` | Fire a parallel "hedge" request if Easynews is slower than this |
 | `SEARCH_ATTEMPT_TIMEOUT_SECONDS` | `2.5` | Per-request read timeout |
 | `SEARCH_TRUST_EMPTY` | `true` | Treat a fast successful "0 results" as final (no-result queries ~0.3s vs ~3.3s); `false` = old 3-try-on-empty |
+| `EASYNEWS_KEEPALIVE` | `true` | Background thread keeps a warm TLS connection during idle gaps; `false` disables it (search pays the handshake after an idle gap) |
+| `EASYNEWS_KEEPALIVE_INTERVAL_SECONDS` | `45` | How often the keepalive thread wakes to maybe ping |
+| `EASYNEWS_KEEPALIVE_IDLE_SECONDS` | `40` | Only ping after this many seconds of no real search traffic |
 | `IGNORE_SEASON_PACKS` | `false` | Skip season-only queries (season, no episode) — Easynews rarely has real packs |
 | `EASYNEWS_SEARCH_API` | `2.0` | Search endpoint: `2.0` (`/2.0/search/solr-search/`) or `3.0` (`/3.0/api/search`, no trailing slash) |
 | `EASYNEWS_BASE_URL` | `https://members.easynews.com` | Override the Easynews host |
