@@ -483,12 +483,17 @@ class EasynewsClient:
             nonlocal started
             started += 1
             idx = started
+            # Give each attempt the whole remaining budget as its read timeout, so
+            # we never kill an in-flight response that could still arrive before the
+            # global deadline. A fast response returns the instant it arrives — the
+            # timeout is a ceiling, not a delay — so the common case is unchanged.
+            attempt_to = max(deadline - time.monotonic(), 0.1)
 
             def _run() -> None:
                 try:
                     data = self._search_once(
                         query, file_type, page, per_page, sort_field, sort_dir,
-                        safe_off, timeout=attempt_timeout, nonce=random.random(),
+                        safe_off, timeout=attempt_to, nonce=random.random(),
                     )
                     results.put(("ok", data))
                 except Exception as exc:  # noqa: BLE001 - reported back to the loop
