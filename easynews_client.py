@@ -218,6 +218,10 @@ class EasynewsClient:
             }
         )
         self.s.auth = (self.username, self.password)
+        # Pool sized for peak burst: gunicorn threads × hedge attempts (4×3=12).
+        _adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        self.s.mount("https://", _adapter)
+        self.s.mount("http://", _adapter)
 
     def login(self) -> None:
         """
