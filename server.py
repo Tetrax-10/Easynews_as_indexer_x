@@ -139,6 +139,32 @@ ALLOW_PASSWORD = _env_bool("EASYNEWS_ALLOW_PASSWORD", False)
 # token set, so precision is unchanged. Default on (it's a recall fix).
 STRIP_STOPWORDS = _env_bool("EASYNEWS_STRIP_STOPWORDS", True)
 
+# Transliterate Norwegian letters (ø→oe, å→aa, æ→ae, and uppercase) everywhere
+# the query is matched. Scene/Usenet releases routinely ASCII-fold these — a film
+# titled "Trøst" is posted as "Troest" — so a client searching the accented form
+# AND-matches nothing on Easynews and zeroes out. We fold the OUTBOUND query so
+# Easynews finds the ASCII-named release, and fold both sides of the title filters
+# (so a "Troest" hit isn't then dropped for not containing "trøst"). Folding is
+# symmetric and only touches æ/ø/å, so an already-ASCII release named "Trost"
+# still won't collide — non-Norwegian queries are untouched. Default off (opt-in).
+TRANSLITERATE_NORWEGIAN = _env_bool("EASYNEWS_TRANSLITERATE_NORWEGIAN", False)
+
+# ø→oe, å→aa, æ→ae (str.translate maps a code point to a replacement string).
+_NORWEGIAN_TRANSLITERATION = {
+    ord("æ"): "ae", ord("Æ"): "Ae",
+    ord("ø"): "oe", ord("Ø"): "Oe",
+    ord("å"): "aa", ord("Å"): "Aa",
+}
+
+
+def _transliterate_norwegian(text: str) -> str:
+    """Fold Norwegian æ/ø/å to their conventional ASCII digraphs (ae/oe/aa).
+    No-op on text without those letters, so it's safe to call unconditionally
+    once the feature flag is on."""
+    if not text:
+        return text
+    return text.translate(_NORWEGIAN_TRANSLITERATION)
+
 # Extra metadata emitted as newznab:attr so downstream tools can use it. The
 # audio/subtitle language codes come from Easynews's named JSON fields
 # (subtitle_tracks/slangs, audio_tracks/alangs) and only exist when the endpoint
@@ -478,6 +504,11 @@ def _tokenize(text: str) -> List[str]:
     if not text:
         return []
     normalized = _TOKEN_SPLIT_RE.sub(" ", text.lower())
+    if TRANSLITERATE_NORWEGIAN:
+        # Fold here so the query and the title (both routed through _tokenize)
+        # compare in the same ASCII space — "trøst" and "troest" both become
+        # "troest", so a folded query still subset-matches an ASCII release.
+        normalized = _transliterate_norwegian(normalized)
     tokens = [
         tok for tok in normalized.split() if len(tok) > 1 and tok not in _STOPWORDS
     ]
@@ -530,6 +561,10 @@ def _sanitize_phrase(text: str) -> str:
     working = text.replace("&", " and ")
     working = _SANITIZE_SYMBOLS_RE.sub(" ", working)
     working = _NON_ALNUM_RE.sub("", working)
+    if TRANSLITERATE_NORWEGIAN:
+        # Same symmetric fold as _tokenize, so the strict-phrase match (query vs
+        # title both pass through here) lines up in ASCII space.
+        working = _transliterate_norwegian(working)
     return working.lower().strip()
 
 
@@ -1108,6 +1143,12 @@ def api():
             search_q = _clean_search_query(q)
             if STRIP_STOPWORDS:
                 search_q = _strip_search_stopwords(search_q)
+                
+            # Fold Norwegian letters so we ask Easynews for the ASCII-folded form
+            # releases are actually posted under (a "Trøst" search → "Troest").
+            # The title filters fold the same way, so matching stays consistent.
+            if TRANSLITERATE_NORWEGIAN:
+                search_q = _transliterate_norwegian(search_q)
 
             # Kick off the extra-term searches (EASYNEWS_EXTRA_TERMS) CONCURRENTLY
             # with the bare search, so a slow query doesn't pay for them serially
