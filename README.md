@@ -81,6 +81,7 @@ docker compose --profile easynews-indexer pull   # grab the latest image
 docker compose --profile easynews-indexer up -d
 ```
 
+
 ## Setup (Docker, standalone)
 
 ```bash
