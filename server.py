@@ -226,9 +226,13 @@ def _join_langs(value: Any) -> Optional[str]:
         return None
     seen: List[str] = []
     for p in parts:
-        if p and p not in seen:
-            seen.append(p)
-    return ",".join(seen) if seen else None
+        if p:
+            # Look up the code in our mapping (e.g., turn 'nob' into 'nor')
+            # if it's not in the map, keep the original code.
+            canon = _LANG_CANON.get(p, p)
+            if canon not in seen:
+                seen.append(canon)
+    return ",".join(sorted(seen)) if seen else None
     
 # ── Subtitle/audio language canonicalisation ────────────────────────────────
 # Easynews tags tracks with ISO 639-2 codes, sometimes the bibliographic (/B)
