@@ -229,7 +229,52 @@ def _join_langs(value: Any) -> Optional[str]:
         if p and p not in seen:
             seen.append(p)
     return ",".join(seen) if seen else None
+    
+# ── Subtitle/audio language canonicalisation ────────────────────────────────
+# Easynews tags tracks with ISO 639-2 codes, sometimes the bibliographic (/B)
+# variant (ger/fre/dut/chi/cze/gre/rum/slo/alb/baq/geo/mac/may), and tags
+# Norwegian as the specific "nob" (Bokmål) rather than the macrolanguage "nor".
+# Clients filter with whatever code they have — "nor", the 2-letter "no", "nb",
+# etc. We fold every known variant of a language to one token so a &subs= /
+# EASYNEWS_REQUIRE_SUBS filter matches regardless of which code is used on either
+# side. Matching only — the emitted attrs keep Easynews's raw codes.
+_LANG_GROUPS = (
+    ("nor", ("no", "nb", "nn", "nob", "nno", "nor")),  # Norwegian (+Bokmål/Nynorsk)
+    ("eng", ("en", "eng")), ("swe", ("sv", "swe")), ("dan", ("da", "dan")),
+    ("fin", ("fi", "fin")), ("isl", ("is", "ice", "isl")), ("ara", ("ar", "ara")),
+    ("ger", ("de", "ger", "deu")), ("fre", ("fr", "fre", "fra")),
+    ("spa", ("es", "spa")), ("ita", ("it", "ita")), ("dut", ("nl", "dut", "nld")),
+    ("por", ("pt", "por")), ("rus", ("ru", "rus")), ("pol", ("pl", "pol")),
+    ("cze", ("cs", "cze", "ces")), ("gre", ("el", "gre", "ell")),
+    ("rum", ("ro", "rum", "ron")), ("slo", ("sk", "slo", "slk")),
+    ("alb", ("sq", "alb", "sqi")), ("arm", ("hy", "arm", "hye")),
+    ("baq", ("eu", "baq", "eus")), ("geo", ("ka", "geo", "kat")),
+    ("mac", ("mk", "mac", "mkd")), ("may", ("ms", "may", "msa")),
+    ("chi", ("zh", "chi", "zho")), ("hrv", ("hr", "hrv")), ("hun", ("hu", "hun")),
+    ("est", ("et", "est")), ("cat", ("ca", "cat")), ("heb", ("he", "heb")),
+    ("hin", ("hi", "hin")), ("ind", ("id", "ind")), ("jpn", ("ja", "jpn")),
+    ("kor", ("ko", "kor")), ("tur", ("tr", "tur")), ("ukr", ("uk", "ukr")),
+    ("vie", ("vi", "vie")), ("tha", ("th", "tha")), ("srp", ("sr", "srp")),
+    ("slv", ("sl", "slv")), ("lit", ("lt", "lit")), ("lav", ("lv", "lav")),
+    ("bul", ("bg", "bul")), ("aze", ("az", "aze")), ("kaz", ("kk", "kaz")),
+    ("kan", ("kn", "kan")), ("khm", ("km", "khm")), ("kir", ("ky", "kir")),
+    ("mal", ("ml", "mal")), ("tam", ("ta", "tam")), ("tel", ("te", "tel")),
+    ("glg", ("gl", "glg")),
+)
+_LANG_CANON: Dict[str, str] = {
+    alias: canon for canon, aliases in _LANG_GROUPS for alias in aliases
+}
 
+
+def _canon_langs(codes: List[str]) -> Set[str]:
+    """Fold a list of language codes to canonical tokens (see _LANG_GROUPS) so
+    equivalent ISO 639 variants (no/nb/nob/nor, ger/de/deu, …) compare equal."""
+    out: Set[str] = set()
+    for c in codes:
+        c = (c or "").strip().lower()
+        if c:
+            out.add(_LANG_CANON.get(c, c))
+    return out
 
 def require_apikey() -> bool:
     key = request.args.get("apikey") or request.headers.get("X-Api-Key")
@@ -912,8 +957,14 @@ def filter_and_map(
         # include at least one requested language. Not gated by
         # DISABLE_RESULT_FILTERS — it's an explicit content requirement.
         if require_subs:
-            item_sub_set = {s for s in (_join_langs(sub_langs) or "").split(",") if s}
-            if not (item_sub_set & set(require_subs)):
+            # item_sub_set = {s for s in (_join_langs(sub_langs) or "").split(",") if s}
+            # if not (item_sub_set & set(require_subs)):
+            
+            # Canonicalise both sides so &subs=nor (or no, or nob) matches
+            # however Easynews tagged the track — it uses ISO 639-2 and tags
+            # Norwegian as the specific "nob" (Bokmål), not the macro "nor".
+            item_subs = [s for s in (_join_langs(sub_langs) or "").split(",") if s]
+            if not (_canon_langs(item_subs) & _canon_langs(require_subs)):
                 continue
 
         duration_formatted = _format_duration(duration_seconds)
