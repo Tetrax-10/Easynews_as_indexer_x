@@ -2,10 +2,13 @@
 Easynews API-like client (unofficial) to perform searches and download NZB files.
 
 This client mimics the webapp behavior by calling:
-- GET /2.0/search/solr-search for search results (JSON)
-- POST /2.0/api/dl-nzb to create/download NZB for selected items
+- GET /2.0/search/solr-search/ (or /3.0/api/search, see EASYNEWS_SEARCH_API)
+  for search results (JSON)
+- POST /2.0/api/dl-nzb to create/download NZB for selected items (always 2.0)
 
-Authentication is cookie-based via username/password POST to the login endpoint.
+Authentication is HTTP Basic Auth set on the requests session (self.s.auth) —
+every request carries it. login() only primes and validates the session; a
+stale/failed cookie refresh does not stop searches from working.
 You'll need a valid Easynews account. Use responsibly and per Easynews TOS.
 """
 
@@ -66,9 +69,9 @@ def max_pages() -> int:
 
 # ──────────────────────────────────────────────────────────────────────────
 # Sorting (env-configurable, multi-level). Easynews ranks by up to three sort
-# keys. By default ONLY the primary key the caller passes is emitted, so
-# behaviour is unchanged unless you set these. Set EASYNEWS_SORT_1 to override
-# the primary field, and SORT_2/SORT_3 to add tie-breakers.
+# keys. With none of these set, only the primary key the caller passes is
+# emitted. Set EASYNEWS_SORT_1 to override the primary field, and SORT_2/SORT_3
+# to add tie-breakers.
 #   field values: relevance | dsize (size) | dtime (date posted) | dsubject
 #   direction:    "-" = descending (default) | "+" = ascending
 # A good "biggest, then most-relevant, then newest" order is:
@@ -106,9 +109,8 @@ _FILE_EXTENSIONS = os.environ.get(
 
 
 def _sort_params(sort_field: Optional[str], sort_dir: str) -> Dict[str, str]:
-    """Build s1/s2/s3 sort params. Env vars override; otherwise the single
-    caller-supplied sort_field/sort_dir is used as the primary key, which keeps
-    the default behaviour identical to before this was configurable."""
+    """Build s1/s2/s3 sort params. Env vars override; with none set, the single
+    caller-supplied sort_field/sort_dir becomes the primary (and only) key."""
     params: Dict[str, str] = {}
     s1 = _SORT_1 or (sort_field or "")
     s1d = _SORT_1_DIR or sort_dir or "-"
@@ -170,7 +172,9 @@ _DOWNLOAD_TIMEOUT = 60
 #   budget        – hard wall-clock cap for the whole search call
 #   hedge_after   – if the in-flight request is slower than this, fire a fresh
 #                   parallel one and take whichever returns real data first
-#   attempt_timeout – per-request read timeout (kills a hung socket fast)
+#   attempt_timeout – read timeout for the single-shot fan-out requests (extra
+#                   pages, extra terms, fallback); hedged attempts instead use
+#                   the remaining budget as their read timeout
 _SEARCH_BUDGET = float(os.environ.get("SEARCH_BUDGET_SECONDS", "3.3"))
 _SEARCH_HEDGE_AFTER = float(os.environ.get("SEARCH_HEDGE_AFTER_SECONDS", "1.2"))
 _SEARCH_ATTEMPT_TIMEOUT = float(os.environ.get("SEARCH_ATTEMPT_TIMEOUT_SECONDS", "2.5"))
@@ -179,7 +183,7 @@ _SEARCH_ATTEMPT_TIMEOUT = float(os.environ.get("SEARCH_ATTEMPT_TIMEOUT_SECONDS",
 # connection open during idle gaps so the next real search skips the cold
 # handshake. Toggle the whole thing off with EASYNEWS_KEEPALIVE=false (e.g. to
 # minimise idle account activity); a search will simply pay the handshake cost.
-#   enabled  – master on/off switch (default on, unchanged behaviour)
+#   enabled  – master on/off switch (default on)
 #   interval – how often the background thread wakes to maybe ping
 #   idle     – only ping after this many seconds of no real search traffic
 _KEEPALIVE_ENABLED = os.environ.get("EASYNEWS_KEEPALIVE", "true").strip().lower() in {
@@ -190,9 +194,10 @@ _KEEPALIVE_IDLE = float(os.environ.get("EASYNEWS_KEEPALIVE_IDLE_SECONDS", "40"))
 
 
 # Trust a successful HTTP-200-with-no-data as a genuine "0 results" and return
-# immediately, instead of retrying up to max_attempts and idling out the budget.
-# A real hang/timeout surfaces as an *error* (which still retries + hedges), so
-# an "ok" empty really is empty. Set false for the old 3-try-on-empty behaviour.
+# immediately, instead of retrying it. A real hang/timeout surfaces as an
+# *error* (which still retries + hedges), so an "ok" empty really is empty.
+# Set false to re-try empties up to max_attempts (a no-result query then costs
+# one round-trip per attempt instead of one round-trip total).
 _TRUST_EMPTY = os.environ.get("SEARCH_TRUST_EMPTY", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
@@ -405,8 +410,8 @@ class EasynewsClient:
     ) -> str:
         """Dispatch to the configured endpoint builder.
 
-        EASYNEWS_SEARCH_URL_TEMPLATE > EASYNEWS_SEARCH_API. Default is the proven
-        2.0 solr-search builder, so behaviour is unchanged unless you opt in.
+        EASYNEWS_SEARCH_URL_TEMPLATE > EASYNEWS_SEARCH_API; the default is the
+        proven 2.0 solr-search builder.
         """
         if _SEARCH_URL_TEMPLATE:
             return _SEARCH_URL_TEMPLATE.format(
@@ -608,8 +613,8 @@ class EasynewsClient:
 
         Fires a search; if Easynews hasn't answered within ``hedge_after`` seconds,
         fires a fresh parallel ("hedged") request and returns whichever delivers
-        real data first. Every attempt uses a short read timeout, and the whole
-        call is capped at ``budget`` seconds — so one slow or hung Easynews
+        real data first. Each attempt's read timeout is capped by the remaining
+        budget, and the whole call by ``budget`` seconds — so one slow or hung Easynews
         response can neither blow the downstream (NZBHydra) timeout nor produce a
         spurious "0 results". If every attempt is empty/slow within the budget,
         the best available payload is returned (genuinely-empty results can't be
@@ -673,7 +678,7 @@ class EasynewsClient:
                 # as an error, not here, so this is a genuine "0 results".
                 if _TRUST_EMPTY:
                     return payload
-                last_empty = payload  # keep the old 3-try-on-empty behaviour
+                last_empty = payload  # TRUST_EMPTY off: remember it, retry up to max_attempts
             if started < max_attempts:
                 _launch()  # error or empty → try a fresh request within budget
             elif received >= started:
@@ -742,8 +747,11 @@ class EasynewsClient:
         ]
         for t in threads:
             t.start()
+        # Shared deadline: the grace covers the whole page fan-out, not each
+        # thread in turn (per-thread timeouts accumulate when pages hang).
+        join_deadline = time.monotonic() + attempt_timeout + 1.0
         for t in threads:
-            t.join(timeout=attempt_timeout + 1.0)
+            t.join(timeout=max(0.0, join_deadline - time.monotonic()))
         return out
 
     def search_queries(
@@ -791,8 +799,12 @@ class EasynewsClient:
         ]
         for t in threads:
             t.start()
+        # Shared deadline across the fan-out (see fetch_more_pages): the caller's
+        # grace is a stage budget, and returning within it means rows that DID
+        # arrive get merged instead of being discarded with the overrun.
+        join_deadline = time.monotonic() + attempt_timeout + 1.0
         for t in threads:
-            t.join(timeout=attempt_timeout + 1.0)
+            t.join(timeout=max(0.0, join_deadline - time.monotonic()))
         return out, status["degraded"]
 
     @staticmethod
@@ -808,9 +820,9 @@ class EasynewsClient:
 
             if isinstance(it, list):
                 if len(it) >= 12:
-                    hash_id = it
-                    filename_no_ext = it
-                    ext = it
+                    hash_id = it[0]
+                    filename_no_ext = it[10]
+                    ext = it[11]
             elif isinstance(it, dict):
                 if "0" in it:
                     hash_id = it.get("0", "")

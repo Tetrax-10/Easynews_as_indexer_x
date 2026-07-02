@@ -46,7 +46,8 @@ logger = logging.getLogger(__name__)
 APP = Flask(__name__)
 _CLIENT: Optional[EasynewsClient] = None
 _CLIENT_LOCK = threading.Lock()
-_CLIENT_LOGIN_TTL = 86400  # seconds between session refreshes
+_CLIENT_LOGIN_TTL = 86400  # 24 h between background session refreshes (searches
+                           # ride Basic Auth regardless, so this is not critical)
 _CLIENT_LAST_LOGIN: float = 0.0
 _CLIENT_REFRESHING = False  # guard so only one background refresh runs at a time
 
@@ -116,14 +117,14 @@ IGNORE_SEASON_PACKS = _env_bool("IGNORE_SEASON_PACKS", False)
 # year/quality, and query-token subset). Validity checks (hash/ext, min size,
 # virus/password/duration) still apply. Useful if a downstream client (Sonarr/
 # Radarr) does its own matching and you'd rather hand it everything Easynews
-# returns. Default off → behaviour unchanged.
+# returns. Default off.
 DISABLE_RESULT_FILTERS = _env_bool("EASYNEWS_DISABLE_FILTERS", False)
 
 # When de-duplicating identical-hash entries, keep the one with the newest post
 # date instead of the first (which is by relevance). Helps when an old post has
 # gone dead and the exact same file was re-posted later. Note: re-packed/re-
 # encoded re-uploads have a *different* hash and are never deduped anyway.
-# Default off = keep first (unchanged behaviour).
+# Default off = keep the first (relevance-ranked) entry.
 DEDUP_KEEP_NEWEST = _env_bool("EASYNEWS_DEDUP_KEEP_NEWEST", False)
 
 # Keep results Easynews flags as password-protected. The flag is a heuristic and
@@ -131,8 +132,8 @@ DEDUP_KEEP_NEWEST = _env_bool("EASYNEWS_DEDUP_KEEP_NEWEST", False)
 # full metadata (runtime/codecs) it could only read if the file weren't actually
 # locked — and when something is genuinely passworded the password is usually
 # posted alongside in an NFO/TXT. stremthru and AIOStreams keep these; this lets
-# you match that. Virus-flagged items are still always dropped. Default off
-# (drop password-flagged), unchanged behaviour.
+# you match that. Virus-flagged items are still always dropped. Default off =
+# password-flagged results are dropped.
 ALLOW_PASSWORD = _env_bool("EASYNEWS_ALLOW_PASSWORD", False)
 
 # Drop connector stopwords (and/of/the/…) from the query sent to Easynews.
@@ -248,15 +249,14 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# ── (#4) Search-result cache ────────────────────────────────────────────────
+# ── Search-result cache ─────────────────────────────────────────────────────
 # Prowlarr/Sonarr/Radarr poll the indexer with the same queries constantly (RSS
-# sync, re-runs, multiple apps). We only cached the *login* before, so every
-# search hit Easynews. This caches the final mapped+filtered item list per
-# distinct query for a short TTL, so repeats return instantly and don't spend an
-# Easynews request. Single worker / shared threads (gunicorn -w1 --threads N), so
+# sync, re-runs, multiple apps). This caches the final mapped+filtered item
+# list per distinct query for a short TTL, so repeats return instantly and
+# don't spend an Easynews request. Single worker / shared threads (gunicorn -w1 --threads N), so
 # a plain module-level dict is shared across all request threads.
 # TTL is deliberately SHORT for an indexer: too long and a just-posted release is
-# invisible until it expires. 0 = caching off (unchanged behaviour).
+# invisible until it expires. 0 = caching off.
 CACHE_TTL_SECONDS = _env_int("EASYNEWS_CACHE_TTL_SECONDS", 0)
 CACHE_MAX_ENTRIES = _env_int("EASYNEWS_CACHE_MAX_ENTRIES", 512)
 _SEARCH_CACHE: "OrderedDict[str, tuple[float, List[dict]]]" = OrderedDict()
@@ -288,10 +288,10 @@ def _cache_put(key: str, items: List[dict]) -> None:
             _SEARCH_CACHE.popitem(last=False)  # evict oldest (LRU)
 
 
-# ── (#5/#6) 0-result fallback: spelling variants + alternate titles ─────────
+# ── 0-result fallback: spelling variants + alternate titles ─────────────────
 # When the primary search returns NOTHING, optionally run extra "backup"
-# searches built from (5) alternate ASCII spellings of the title and (6)
-# curated alternate titles. Gated so the extra Easynews requests only fire when
+# searches built from alternate ASCII spellings of the title and curated
+# alternate titles. Gated so the extra Easynews requests only fire when
 # they could actually help (a 0-result query), never on a query that already
 # found something — no wasted requests in the common case.
 FALLBACK_SEARCH = _env_bool("EASYNEWS_FALLBACK_SEARCH", False)
@@ -305,7 +305,7 @@ FALLBACK_MAX_QUERIES = _env_int("EASYNEWS_FALLBACK_MAX_QUERIES", 6)
 FALLBACK_BUDGET_SECONDS = _env_float("EASYNEWS_FALLBACK_BUDGET_SECONDS", 4.0)
 # Run EASYNEWS_EXTRA_TERMS only as part of the 0-result fallback, instead of
 # alongside every search. Saves the per-search extra requests when the bare
-# query already returns results. Default off = current always-on behaviour.
+# query already returns results. Default off = extra terms run on every search.
 EXTRA_TERMS_FALLBACK_ONLY = _env_bool("EASYNEWS_EXTRA_TERMS_FALLBACK_ONLY", False)
 
 # Curated alternate-title map (canonical title -> [aliases]). JSON file, same
@@ -356,7 +356,9 @@ _VAR_BAREVOWEL = {
     ord("ö"): "o", ord("Ö"): "O", ord("ü"): "u", ord("Ü"): "U",
     ord("ß"): "ss",
 }
-_VAR_PRESTRIP = {  # letters NFKD won't decompose; map before stripping accents
+# Applied before the NFKD accent strip: ø/æ/ß/đ/ł never NFKD-decompose so they
+# need explicit maps (å/Å would decompose on their own; included for uniformity).
+_VAR_PRESTRIP = {
     ord("ø"): "o", ord("Ø"): "O", ord("å"): "a", ord("Å"): "A",
     ord("æ"): "ae", ord("Æ"): "Ae", ord("ß"): "ss", ord("đ"): "d", ord("Đ"): "D",
     ord("ł"): "l", ord("Ł"): "L",
@@ -520,9 +522,9 @@ def client() -> EasynewsClient:
             return _CLIENT
 
         # Periodic refresh runs in a background thread so the current request is
-        # never blocked on the login round-trip. This is what was causing the
-        # downstream (NZBHydra) ~4s timeouts whenever a refresh coincided with a
-        # search and Easynews was slow to answer the login.
+        # never blocked on the login round-trip — a blocking refresh on the
+        # request path pushes the response past NZBHydra's ~4s timeout whenever
+        # Easynews answers the login slowly.
         if (
             now - _CLIENT_LAST_LOGIN > _CLIENT_LOGIN_TTL
             and not _CLIENT_REFRESHING
@@ -545,8 +547,8 @@ def client() -> EasynewsClient:
 def _warm_up_login() -> None:
     """
     Log in once at startup, in the background, so the first real search after a
-    container (re)start doesn't pay the blocking login cost (which previously
-    pushed that first request past NZBHydra's timeout).
+    container (re)start doesn't pay a blocking login that can push the response
+    past NZBHydra's timeout.
     """
     try:
         client()
@@ -660,7 +662,7 @@ _ALLOWED_VIDEO_EXTENSIONS = {
 
 _STOPWORDS = {"the", "a", "an", "and", "of", "in", "for", "on"}
 
-# (#8) Minimum real-video duration. Easynews is full of short preview/sample
+# Minimum real-video duration. Easynews is full of short preview/sample
 # clips — many run 2–5 minutes and sail past a 60s floor, showing up as junk
 # "releases" a downstream client may grab and then fail on. Raise this (e.g. 360
 # = 6 minutes, matching the upstream addon) to cut clip noise. Lower it only if
@@ -686,6 +688,14 @@ _SEASON_ONLY_RE = re.compile(
 )
 _SEASON_TOKEN_RE = re.compile(r"^s\d{1,2}$", re.IGNORECASE)
 _ANIME_BRACKET_GROUP_RE = re.compile(r"^\[([^\]]+)\]", re.IGNORECASE)
+_ANIME_EPISODE_RES = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"[\s\-_]+\d{1,4}(?:\s*v\d+)?[\s\-_\.\(\[]",
+        r"[\s\-_]Ep?\.?\s*\d{1,4}",
+        r"[\s\-_]Episode\s*\d{1,4}",
+    )
+)
 
 _KNOWN_FANSUB_GROUPS = {
     "subsplease", "erai-raws", "horriblesubs", "judas", "gjm",
@@ -708,6 +718,15 @@ CATEGORY_ANIME = 5070
 CATEGORY_OTHER = 7000
 
 
+# Precompiled h/m/s unit patterns — _parse_duration_seconds runs once per raw
+# result row, so these are deliberately not built per call.
+_DURATION_UNIT_RES = (
+    (re.compile(r"(\d+)\s*h"), 3600),
+    (re.compile(r"(\d+)\s*m"), 60),
+    (re.compile(r"(\d+)\s*s"), 1),
+)
+
+
 def _parse_duration_seconds(raw: Any) -> Optional[int]:
     if raw is None:
         return None
@@ -722,8 +741,8 @@ def _parse_duration_seconds(raw: Any) -> Optional[int]:
         return int(text)
     total = 0
     matched = False
-    for label, multiplier in (("h", 3600), ("m", 60), ("s", 1)):
-        for part in re.findall(rf"(\d+)\s*{label}", text):
+    for pattern, multiplier in _DURATION_UNIT_RES:
+        for part in pattern.findall(text):
             total += int(part) * multiplier
             matched = True
     if matched:
@@ -917,15 +936,7 @@ def _detect_anime(title: str) -> bool:
     if group_name not in _KNOWN_FANSUB_GROUPS:
         return False
     title_without_group = title[bracket_match.end():].strip()
-    episode_patterns = [
-        r"[\s\-_]+\d{1,4}(?:\s*v\d+)?[\s\-_\.\(\[]",
-        r"[\s\-_]Ep?\.?\s*\d{1,4}",
-        r"[\s\-_]Episode\s*\d{1,4}",
-    ]
-    return any(
-        re.search(pattern, title_without_group, re.IGNORECASE)
-        for pattern in episode_patterns
-    )
+    return any(p.search(title_without_group) for p in _ANIME_EPISODE_RES)
 
 
 def _detect_category(title: str, metadata: Dict[str, Optional[Any]]) -> int:
@@ -979,14 +990,12 @@ def _matches_strict(title: str, strict_phrase: Optional[str]) -> bool:
         return False
     if candidate == strict_phrase:
         return True
-    candidate_tokens = candidate.split()
     phrase_tokens = strict_phrase.split()
     if not phrase_tokens:
         return True
-    for idx in range(0, max(1, len(candidate_tokens) - len(phrase_tokens) + 1)):
-        if candidate_tokens[idx : idx + len(phrase_tokens)] == phrase_tokens:
-            return True
-    return False
+    # Contiguous token-run match, done as a space-padded substring test (tokens
+    # are whitespace-split so they can't contain spaces themselves).
+    return f" {' '.join(phrase_tokens)} " in f" {' '.join(candidate.split())} "
 
 
 def _posted_epoch(value: Any) -> float:
@@ -1011,6 +1020,8 @@ def filter_and_map(
 ) -> List[dict]:
     token_set: Set[str] = set(query_tokens or [])
     thumb_base = json_data.get("thumbURL") or json_data.get("thumbUrl")
+    # Loop-invariant: fold the requested subtitle langs once, not per row.
+    require_canon: Optional[Set[str]] = _canon_langs(require_subs) if require_subs else None
     out: List[dict] = []
     seen_hashes: Set[str] = set()
     seen_index: Dict[str, int] = {}  # hash -> index in out (for keep-newest dedup)
@@ -1037,16 +1048,16 @@ def filter_and_map(
 
         if isinstance(it, list):
             if len(it) >= 12:
-                hash_id = it
-                subject = it
-                filename_no_ext = it
-                ext = it
+                hash_id = it[0]
+                subject = it[6]
+                filename_no_ext = it[10]
+                ext = it[11]
             if len(it) > 7:
-                poster = it
+                poster = it[7]
             if len(it) > 8:
-                posted_raw = it
+                posted_raw = it[8]
             if len(it) > 14:
-                duration_raw = it
+                duration_raw = it[14]
         elif isinstance(it, dict):
             hash_id = it.get("hash") or it.get("0") or it.get("id")
             subject = it.get("subject") or it.get("6")
@@ -1137,10 +1148,10 @@ def filter_and_map(
             fallback = subject or f"{filename_no_ext}{ext}"
             title = _normalize_title(fallback)
 
-        quality = _extract_quality(title, fullres)
-        title_meta = _extract_release_markers(title, quality)
-        if not quality and title_meta.get("quality"):
-            quality = title_meta.get("quality")
+        # Quality: prefer what the title says, else fall back to the probed
+        # vertical resolution (fullres / yres).
+        title_meta = _extract_release_markers(title)
+        quality = title_meta.get("quality") or _extract_quality(fullres)
 
         if not DISABLE_RESULT_FILTERS and strict_match and not _matches_strict(title, strict_phrase):
             continue
@@ -1172,15 +1183,13 @@ def filter_and_map(
         # request &subs=). Keep only releases whose reported subtitle tracks
         # include at least one requested language. Not gated by
         # DISABLE_RESULT_FILTERS — it's an explicit content requirement.
-        if require_subs:
-            # item_sub_set = {s for s in (_join_langs(sub_langs) or "").split(",") if s}
-            # if not (item_sub_set & set(require_subs)):
-            
+        subs_joined = _join_langs(sub_langs)
+        if require_canon is not None:
             # Canonicalise both sides so &subs=nor (or no, or nob) matches
             # however Easynews tagged the track — it uses ISO 639-2 and tags
             # Norwegian as the specific "nob" (Bokmål), not the macro "nor".
-            item_subs = [s for s in (_join_langs(sub_langs) or "").split(",") if s]
-            if not (_canon_langs(item_subs) & _canon_langs(require_subs)):
+            item_subs = [s for s in (subs_joined or "").split(",") if s]
+            if not (_canon_langs(item_subs) & require_canon):
                 continue
 
         duration_formatted = _format_duration(duration_seconds)
@@ -1203,7 +1212,7 @@ def filter_and_map(
             "year": year,
             "season": title_meta.get("season"),
             "episode": title_meta.get("episode"),
-            "subs": _join_langs(sub_langs),
+            "subs": subs_joined,
             "audio_langs": _join_langs(audio_langs),
             "vcodec": (str(vcodec).strip() or None) if vcodec else None,
             "acodec": (str(acodec).strip() or None) if acodec else None,
@@ -1288,7 +1297,7 @@ def _run_fallback_search(
     strict_requested: bool,
     extra_terms: Optional[List[str]] = None,
 ) -> "tuple[List[dict], bool]":
-    """0-result backup stage (#5/#6). Builds candidate queries from alternate
+    """0-result backup stage. Builds candidate queries from alternate
     spellings + curated alternate titles (+ optional extra terms), runs them
     concurrently (bounded), and returns the merged, hash-deduped items plus a
     `degraded` flag (True if any backup query errored/429'd, so the caller won't
@@ -1350,8 +1359,11 @@ def _run_fallback_search(
     ]
     for th in threads:
         th.start()
+    # One shared deadline for the whole backup stage — a per-thread join timeout
+    # would accumulate (N hung backups ⇒ N× the budget of request wall-clock).
+    join_deadline = time.monotonic() + FALLBACK_BUDGET_SECONDS + 1.0
     for th in threads:
-        th.join(timeout=FALLBACK_BUDGET_SECONDS + 1.0)
+        th.join(timeout=max(0.0, join_deadline - time.monotonic()))
     if merged:
         logger.info("Fallback search recovered %d result(s).", len(merged))
     return merged, status["degraded"]
@@ -1469,6 +1481,8 @@ def api():
         strict_phrase = _sanitize_phrase(raw_query) if strict_requested else None
         limit = int(request.args.get("limit", "100"))
         offset = int(request.args.get("offset", "0"))
+        # Hard floor: 100 MB minimum file size. A request's &minsize=<MB> can
+        # only RAISE it — lowering below 100 requires a code change here.
         min_size_param = request.args.get("minsize")
         min_size_mb = 100
         if min_size_param:
@@ -1548,9 +1562,7 @@ def api():
                     }
                 ]
         else:
-            c = client()
-            search_start = time.time()
-            # (#4) Serve repeated queries from the short-TTL result cache —
+            # Serve repeated queries from the short-TTL result cache —
             # Prowlarr/Sonarr/Radarr poll constantly. Key on everything that
             # changes the output; offset/limit are sliced AFTER, so paging the
             # same search reuses one entry.
@@ -1564,6 +1576,10 @@ def api():
                 items = cached
                 logger.info("Search %r served from cache → %d item(s)", q, len(items))
             else:
+                # Only a cache miss needs the Easynews client — a hit must never
+                # block on _CLIENT_LOCK (held for the whole login on cold start).
+                c = client()
+                search_start = time.time()
                 # Sanitise the outbound query (a client quirk like "Avengers
                 # --1080p" shouldn't become a broken Easynews query) and drop
                 # connector stopwords; filtering still uses the raw query.
@@ -1580,6 +1596,7 @@ def api():
                 # EASYNEWS_EXTRA_TERMS_FALLBACK_ONLY.
                 aug_holder: Dict[str, Any] = {"rows": [], "degraded": False}
                 aug_thread: Optional[threading.Thread] = None
+                aug_started = 0.0
                 if EXTRA_TERMS and search_q and not EXTRA_TERMS_FALLBACK_ONLY:
                     aug_queries = [f"{search_q} {term}".strip() for term in EXTRA_TERMS]
 
@@ -1594,6 +1611,7 @@ def api():
                     aug_thread = threading.Thread(
                         target=_run_aug, name="ez-extra-terms", daemon=True
                     )
+                    aug_started = time.monotonic()
                     aug_thread.start()
 
                 # Latency-bounded, hedged search: first real results, hard-capped
@@ -1621,7 +1639,13 @@ def api():
                 # Merge the concurrent extra-term rows (prepended so they survive
                 # the limit cut; same filtering still drops off-target shows).
                 if aug_thread is not None:
-                    aug_thread.join(timeout=_SEARCH_ATTEMPT_TIMEOUT + 1.0)
+                    # Grace measured from when the aug queries STARTED (they run
+                    # concurrently with the hedged search) — anchoring it here
+                    # would stack it on top of the search budget and could push
+                    # the response past NZBHydra's timeout.
+                    aug_thread.join(timeout=max(
+                        0.0, aug_started + _SEARCH_ATTEMPT_TIMEOUT + 1.0 - time.monotonic()
+                    ))
                     aug_rows = aug_holder.get("rows") or []
                     if aug_rows:
                         data = {**data, "data": list(aug_rows) + list(data.get("data") or [])}
@@ -1654,7 +1678,7 @@ def api():
                     time.time() - search_start,
                 )
 
-                # (#5/#6) 0-result fallback — only when the primary found nothing,
+                # 0-result fallback — only when the primary found nothing,
                 # so the extra Easynews requests never fire on a query that already
                 # returned results.
                 want_fallback = FALLBACK_SEARCH or (EXTRA_TERMS_FALLBACK_ONLY and bool(EXTRA_TERMS))
@@ -1694,6 +1718,9 @@ def api():
         chan_title = f"Results for {display_q}"
         now_dt = datetime.now(timezone.utc)
         channel_pub = now_dt.strftime("%a, %d %b %Y %H:%M:%S %z")
+        # Request-invariant pieces of the per-item links, hoisted out of the loop.
+        url_base = request.url_root.rstrip("/")
+        apikey = request.args.get("apikey")
 
         header = (
             '<?xml version="1.0" encoding="UTF-8"?>'
@@ -1701,7 +1728,7 @@ def api():
             "<channel>"
             f"<title>{xml_escape(chan_title)}</title>"
             f"<description>{xml_escape(chan_title)}</description>"
-            f"<link>{request.url_root.rstrip('/')}/api</link>"
+            f"<link>{url_base}/api</link>"
             f"<pubDate>{channel_pub}</pubDate>"
         )
 
@@ -1709,7 +1736,7 @@ def api():
         for it in items:
             enc_id = encode_id(it)
             title = xml_escape(it["title"]) if it["title"] else "Untitled"
-            link = f"{request.url_root.rstrip('/')}/api?t=get&id={enc_id}&apikey={request.args.get('apikey')}"
+            link = f"{url_base}/api?t=get&id={enc_id}&apikey={apikey}"
             safe_link = xml_escape(link)
             size = it["size"]
             guid = enc_id

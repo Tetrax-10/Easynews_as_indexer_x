@@ -34,12 +34,14 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# A rule is (core, to, anchor). anchor in {"substr","prefix","suffix","contains"}.
-Rule = Tuple[str, str, str]
+# A rule is (core, to, anchor, pattern). anchor in {"substr","prefix","suffix",
+# "contains"}; pattern is the precompiled word-bounded regex for "substr" rules
+# (compiled once at parse time — apply_rules runs on every search request).
+Rule = Tuple[str, str, str, Optional[re.Pattern]]
 
 # Trailing release metadata to protect from truncation even if a client embeds it
 # in q (e.g. "title s06e03"). Season/episode/quality only — NOT a bare year, so we
@@ -76,7 +78,11 @@ def _parse_rule(match_raw: str, to_raw: str) -> Rule | None:
         anchor = "suffix"
     else:
         anchor = "substr"
-    return (core, to, anchor)
+    pat = (
+        re.compile(r"\b" + re.escape(core) + r"\b", re.IGNORECASE)
+        if anchor == "substr" else None
+    )
+    return (core, to, anchor, pat)
 
 
 def parse_rules(raw: str) -> List[Rule]:
@@ -120,7 +126,7 @@ def apply_rules(title: str, rules: List[Rule]) -> str:
         return title
     head, tail = _split_title_tail(title)
     low = head.lower()
-    for core, to, anchor in rules:
+    for core, to, anchor, pat in rules:
         c = core.lower()
         if anchor == "prefix":
             if low.startswith(c):
@@ -135,7 +141,6 @@ def apply_rules(title: str, rules: List[Rule]) -> str:
                 head = to or core
                 break
         else:  # substr: word-bounded replace of the phrase wherever it appears
-            pat = re.compile(r"\b" + re.escape(core) + r"\b", re.IGNORECASE)
             if pat.search(head):
                 head = pat.sub(to, head)
                 break
